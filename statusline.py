@@ -2,7 +2,7 @@
 """
 Claude Code Statusline 显示脚本
 在 Claude Code 底部状态栏显示用量信息
-支持从 stdin 读取实时 context 数据
+支持从 stdin 读取实时 context 数据，带记忆功能
 """
 
 import json
@@ -10,6 +10,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any
+
+# 缓存文件（保存 context 等会话数据）
+CACHE_FILE = Path.home() / ".claude" / "statusline-cache.json"
 
 # ANSI 颜色代码
 class Colors:
@@ -52,6 +55,26 @@ def load_json(file_path: Path) -> Optional[Dict[str, Any]]:
     return None
 
 
+def save_json(file_path: Path, data: Dict[str, Any]) -> bool:
+    """保存 JSON 文件"""
+    try:
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def load_cache() -> Dict[str, Any]:
+    """加载缓存数据"""
+    return load_json(CACHE_FILE) or {}
+
+
+def save_cache(cache: Dict[str, Any]) -> bool:
+    """保存缓存数据"""
+    return save_json(CACHE_FILE, cache)
+
+
 def read_stdin_json() -> Optional[Dict[str, Any]]:
     """从 stdin 读取 JSON 数据（Claude Code statusline 传入）"""
     try:
@@ -62,6 +85,49 @@ def read_stdin_json() -> Optional[Dict[str, Any]]:
     except Exception:
         pass
     return None
+
+
+def get_context_percentage(stdin_data: Optional[Dict]) -> float:
+    """从 stdin 数据中提取 context 使用率，支持多种字段格式"""
+    if not stdin_data:
+        return 0
+
+    # Claude Code 可能使用不同的字段名格式
+    # 尝试 camelCase 和 snake_case
+    paths = [
+        ["contextWindow", "usedPercentage"],
+        ["contextWindow", "used_percentage"],
+        ["contextWindow", "used"],
+        ["context_window", "usedPercentage"],
+        ["context_window", "used_percentage"],
+        ["context", "usedPercentage"],
+        ["context", "used_percentage"],
+    ]
+
+    for path in paths:
+        obj = stdin_data
+        for key in path:
+            if isinstance(obj, dict):
+                obj = obj.get(key)
+            else:
+                obj = None
+                break
+        if obj is not None:
+            try:
+                return float(obj)
+            except (ValueError, TypeError):
+                continue
+
+    # 直接字段
+    for key in ["usedPercentage", "used_percentage", "contextUsed", "context_used", "contextPercentage"]:
+        val = stdin_data.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                continue
+
+    return 0
 
 
 def format_time_remaining(reset_at: Optional[float]) -> str:
@@ -130,20 +196,31 @@ def main():
     # 尝试从 stdin 读取实时数据
     stdin_data = read_stdin_json()
 
-    # 加载配置文件
+    # 加载配置文件和缓存
     status_cache = load_json(STATUS_CACHE)
     settings = load_json(SETTINGS_FILE)
+    cache = load_cache()
 
     # 获取用量数据
     usage_data = {}
     if status_cache and "usageData" in status_cache:
         usage_data = status_cache["usageData"]
 
-    # 获取 context 使用率（从 stdin 或缓存）
-    context_pct = 0
-    if stdin_data:
-        context_window = stdin_data.get("contextWindow", {})
-        context_pct = context_window.get("usedPercentage", 0) or 0
+    # 获取 context 使用率（从 stdin）
+    context_pct = get_context_percentage(stdin_data)
+
+    # 如果收到有效的 context 数据，更新缓存
+    if context_pct > 0:
+        cache["last_context_pct"] = context_pct
+        cache["last_context_update"] = time.time()
+        save_cache(cache)
+    else:
+        # 使用缓存的值
+        cached_pct = cache.get("last_context_pct", 0)
+        cached_time = cache.get("last_context_update", 0)
+        # 如果缓存不超过 5 分钟，使用缓存值
+        if cached_pct > 0 and (time.time() - cached_time) < 300:
+            context_pct = cached_pct
 
     # 计算数值
     util_5h = usage_data.get("utilization5h", 0) * 100
