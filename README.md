@@ -180,8 +180,6 @@ chmod +x ~/Developer/claude-statusline/statusline.py
 ## 📮 联系方式
 
 - Issues: [GitHub Issues](https://github.com/YOUR_USERNAME/claude-statusline/issues)
-- Email: your.email@example.com
-
 ---
 
 ⭐ 如果这个项目对你有帮助，请给个 Star 支持一下！
