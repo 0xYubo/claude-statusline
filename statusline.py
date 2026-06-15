@@ -2,81 +2,45 @@
 """
 Claude Code Statusline 显示脚本
 在 Claude Code 底部状态栏显示用量信息
-支持从 stdin 读取实时 context 数据，带记忆功能
+
+数据来源：
+- Context: 从 stdin 的 context_window 读取（每个会话独立）
+- Usage/Weekly: 从 stdin 的 rate_limits 读取（账号级别，所有会话共享）
+
+多会话共享机制：
+rate_limits 不是每次刷新都会传入（仅 API 响应后才有），
+因此收到时写入共享缓存文件，未收到时回退读取缓存，
+实现所有会话显示一致的账号用量。
 """
 
 import json
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-# 缓存文件（保存 context 等会话数据）
-CACHE_FILE = Path.home() / ".claude" / "statusline-cache.json"
 
 # ANSI 颜色代码
 class Colors:
-    # 亮色系
-    GREEN = "\033[92m"        # 亮绿
-    YELLOW = "\033[93m"       # 亮黄
-    RED = "\033[91m"          # 亮红
-    CYAN = "\033[96m"         # 亮青
-    MAGENTA = "\033[95m"      # 亮紫
-    BLUE = "\033[94m"         # 亮蓝
-    WHITE = "\033[97m"        # 亮白
-
-    # 进度条颜色（更鲜艳）
-    BAR_GREEN = "\033[92m"    # 亮绿
-    BAR_YELLOW = "\033[93m"   # 亮黄
-    BAR_RED = "\033[91m"      # 亮红
-    BAR_CYAN = "\033[96m"     # 亮青
-    BAR_BLUE = "\033[94m"     # 亮蓝
-
-    # 样式
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    CYAN = "\033[96m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
     RESET = "\033[0m"
 
 
-# 配置文件路径
-CLAUDE_DIR = Path.home() / ".claude"
-STATUS_CACHE = CLAUDE_DIR / "vscode-claude-status-cache.json"
-SETTINGS_FILE = CLAUDE_DIR / "settings.json"
-
-
-def load_json(file_path: Path) -> Optional[Dict[str, Any]]:
-    """加载 JSON 文件"""
-    try:
-        if file_path.exists():
-            with open(file_path, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return None
-
-
-def save_json(file_path: Path, data: Dict[str, Any]) -> bool:
-    """保存 JSON 文件"""
-    try:
-        with open(file_path, "w") as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception:
-        return False
-
-
-def load_cache() -> Dict[str, Any]:
-    """加载缓存数据"""
-    return load_json(CACHE_FILE) or {}
-
-
-def save_cache(cache: Dict[str, Any]) -> bool:
-    """保存缓存数据"""
-    return save_json(CACHE_FILE, cache)
+# 共享缓存文件：保存账号级别的 rate_limits，实现多会话同步
+CACHE_FILE = Path.home() / ".claude" / "statusline-cache.json"
+# 缓存有效期（秒）：超过则视为过期，避免显示陈旧数据
+CACHE_TTL = 600
 
 
 def read_stdin_json() -> Optional[Dict[str, Any]]:
-    """从 stdin 读取 JSON 数据（Claude Code statusline 传入）"""
+    """从 stdin 读取 Claude Code 传入的 JSON 数据"""
     try:
         if not sys.stdin.isatty():
             data = sys.stdin.read()
@@ -87,47 +51,55 @@ def read_stdin_json() -> Optional[Dict[str, Any]]:
     return None
 
 
-def get_context_percentage(stdin_data: Optional[Dict]) -> float:
-    """从 stdin 数据中提取 context 使用率，支持多种字段格式"""
-    if not stdin_data:
-        return 0
+def load_cache() -> Dict[str, Any]:
+    """加载共享缓存"""
+    try:
+        if CACHE_FILE.exists():
+            with open(CACHE_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
 
-    # Claude Code 可能使用不同的字段名格式
-    # 尝试 camelCase 和 snake_case
-    paths = [
-        ["contextWindow", "usedPercentage"],
-        ["contextWindow", "used_percentage"],
-        ["contextWindow", "used"],
-        ["context_window", "usedPercentage"],
-        ["context_window", "used_percentage"],
-        ["context", "usedPercentage"],
-        ["context", "used_percentage"],
-    ]
 
-    for path in paths:
-        obj = stdin_data
-        for key in path:
-            if isinstance(obj, dict):
-                obj = obj.get(key)
-            else:
-                obj = None
-                break
-        if obj is not None:
-            try:
-                return float(obj)
-            except (ValueError, TypeError):
-                continue
+def save_cache(rate_limits: Dict[str, Any]) -> None:
+    """原子写入共享缓存（避免多会话并发写入损坏文件）"""
+    try:
+        payload = {
+            "rate_limits": rate_limits,
+            "updated_at": time.time(),
+        }
+        # 先写临时文件再 rename，保证原子性
+        fd, tmp_path = tempfile.mkstemp(dir=str(CACHE_FILE.parent), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, CACHE_FILE)
+    except Exception:
+        pass
 
-    # 直接字段
-    for key in ["usedPercentage", "used_percentage", "contextUsed", "context_used", "contextPercentage"]:
-        val = stdin_data.get(key)
-        if val is not None:
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                continue
 
-    return 0
+def get_rate_limits(stdin_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    获取 rate_limits 数据，实现多会话共享：
+    - stdin 有数据：使用并更新共享缓存
+    - stdin 无数据：回退到共享缓存（其他会话写入的）
+    """
+    rate_limits = stdin_data.get("rate_limits")
+
+    if rate_limits:
+        # 收到实时数据，更新共享缓存供其他会话使用
+        save_cache(rate_limits)
+        return rate_limits
+
+    # 未收到，尝试读取共享缓存
+    cache = load_cache()
+    cached = cache.get("rate_limits")
+    updated_at = cache.get("updated_at", 0)
+
+    if cached and (time.time() - updated_at) < CACHE_TTL:
+        return cached
+
+    return {}
 
 
 def format_time_remaining(reset_at: Optional[float]) -> str:
@@ -147,23 +119,23 @@ def format_time_remaining(reset_at: Optional[float]) -> str:
     return f"{minutes}m"
 
 
-def get_colored_bar(percentage: float, width: int = 10, use_cyan: bool = False) -> str:
+def get_colored_bar(percentage: float, width: int = 10, color_type: str = "auto") -> str:
     """生成带颜色的进度条"""
+    # 百分比限制在 0-100，避免进度条溢出或为负
+    percentage = max(0, min(100, percentage))
     filled = int(width * percentage / 100)
     empty = width - filled
 
-    # 根据百分比选择颜色
     if percentage >= 90:
-        color = Colors.BAR_RED
+        color = Colors.RED
     elif percentage >= 70:
-        color = Colors.BAR_YELLOW
-    elif use_cyan:
-        color = Colors.BAR_CYAN
+        color = Colors.YELLOW
+    elif color_type == "cyan":
+        color = Colors.CYAN
     else:
-        color = Colors.BAR_GREEN
+        color = Colors.GREEN
 
-    bar = f"{color}{'█' * filled}{Colors.DIM}{'░' * empty}{Colors.RESET}"
-    return bar
+    return f"{color}{'█' * filled}{Colors.DIM}{'░' * empty}{Colors.RESET}"
 
 
 def get_percentage_color(percentage: float) -> str:
@@ -172,81 +144,52 @@ def get_percentage_color(percentage: float) -> str:
         return Colors.RED
     elif percentage >= 70:
         return Colors.YELLOW
-    else:
-        return Colors.GREEN
-
-
-def get_model_name(settings: Optional[Dict]) -> str:
-    """获取模型名称"""
-    if settings:
-        env = settings.get("env", {})
-        model = env.get("ANTHROPIC_MODEL")
-        if model:
-            return model
-
-        model = settings.get("model")
-        if model:
-            return model.upper()
-
-    return "Claude"
+    return Colors.GREEN
 
 
 def main():
     """主函数"""
-    # 尝试从 stdin 读取实时数据
     stdin_data = read_stdin_json()
 
-    # 加载配置文件和缓存
-    status_cache = load_json(STATUS_CACHE)
-    settings = load_json(SETTINGS_FILE)
-    cache = load_cache()
+    if not stdin_data:
+        print("Claude Code")
+        return
 
-    # 获取用量数据
-    usage_data = {}
-    if status_cache and "usageData" in status_cache:
-        usage_data = status_cache["usageData"]
+    # 模型信息
+    model_info = stdin_data.get("model", {})
+    model_name = model_info.get("display_name") or model_info.get("id") or "Claude"
 
-    # 获取 context 使用率（从 stdin）
-    context_pct = get_context_percentage(stdin_data)
+    # Context 使用率（当前会话独立，stdin 每次都有）
+    context_window = stdin_data.get("context_window") or {}
+    context_pct = context_window.get("used_percentage") or 0
 
-    # 如果收到有效的 context 数据，更新缓存
-    if context_pct > 0:
-        cache["last_context_pct"] = context_pct
-        cache["last_context_update"] = time.time()
-        save_cache(cache)
-    else:
-        # 使用缓存的值
-        cached_pct = cache.get("last_context_pct", 0)
-        cached_time = cache.get("last_context_update", 0)
-        # 如果缓存不超过 5 分钟，使用缓存值
-        if cached_pct > 0 and (time.time() - cached_time) < 300:
-            context_pct = cached_pct
+    # Rate Limits（账号级别，多会话共享）
+    rate_limits = get_rate_limits(stdin_data)
 
-    # 计算数值
-    util_5h = usage_data.get("utilization5h", 0) * 100
-    util_7d = usage_data.get("utilization7d", 0) * 100
-    reset_5h = usage_data.get("reset5hAt")
-    reset_7d = usage_data.get("reset7dAt")
+    five_hour = rate_limits.get("five_hour") or {}
+    util_5h = five_hour.get("used_percentage") or 0
+    reset_5h = five_hour.get("resets_at")
 
-    # 获取模型
-    model = get_model_name(settings)
+    seven_day = rate_limits.get("seven_day") or {}
+    util_7d = seven_day.get("used_percentage") or 0
+    reset_7d = seven_day.get("resets_at")
 
-    # 格式化输出（带颜色）
-    bar_ctx = get_colored_bar(context_pct, 10, use_cyan=True)
+    # 进度条
+    bar_ctx = get_colored_bar(context_pct, 10, "cyan")
     bar_5h = get_colored_bar(util_5h, 10)
     bar_7d = get_colored_bar(util_7d, 10)
 
+    # 百分比颜色
     pct_ctx_color = get_percentage_color(context_pct)
     pct_5h_color = get_percentage_color(util_5h)
     pct_7d_color = get_percentage_color(util_7d)
 
+    # 重置倒计时
     time_5h = format_time_remaining(reset_5h)
     time_7d = format_time_remaining(reset_7d)
 
-    # 状态栏格式
-    # [Model] │ Context ████████░░ XX% │ Usage ████████░░ XX% (resets in Xh Xm) │ Weekly ████████░░ XX% (resets in Xh Xm)
     output = (
-        f"{Colors.BOLD}{Colors.CYAN}[{model}]{Colors.RESET} │ "
+        f"{Colors.BOLD}{Colors.CYAN}[{model_name}]{Colors.RESET} │ "
         f"Context {bar_ctx} {pct_ctx_color}{context_pct:.0f}%{Colors.RESET} │ "
         f"Usage {bar_5h} {pct_5h_color}{util_5h:.0f}%{Colors.RESET} "
         f"{Colors.DIM}(resets in {time_5h}){Colors.RESET} │ "

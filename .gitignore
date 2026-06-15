@@ -39,3 +39,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# 个人文章草稿
+ARTICLE.md
+
+# 本地缓存
+statusline-cache.json

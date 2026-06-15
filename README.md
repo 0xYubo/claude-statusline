@@ -113,26 +113,24 @@ claude-statusline/
 └── .gitignore
 ```
 
-## 🔧 独立使用（TUI 模式）
+## 🔄 多会话共享原理
 
-除了集成到 Claude Code，还可以作为独立的终端监控面板：
+Usage / Weekly 属于**账号级别**的额度，所有 Claude Code 会话共用同一份。但 Claude Code 只在 **API 响应后**才会通过 stdin 传入 `rate_limits` 数据，定时刷新或刚启动时可能拿不到。
 
-```bash
-# 默认 30s 刷新
-python3 statusline.py
+为此本工具引入了一个**共享缓存文件** `~/.claude/statusline-cache.json`：
 
-# 10s 刷新
-python3 statusline.py -i 10
+- 任意会话收到 `rate_limits` → 原子写入共享缓存
+- 没收到的会话 → 回退读取共享缓存（10 分钟内有效）
 
-# 只显示一次
-python3 statusline.py --once
-```
+这样多个终端窗口看到的 Usage / Weekly 始终一致，不会出现「时有时无」或「各算各的」。
+
+Context 是**单会话**数据，每次刷新都从 stdin 的 `context_window` 实时读取。
 
 ## 🐛 故障排除
 
-### 数据显示 0% 或 N/A
+### Usage / Weekly 显示 0%
 
-Claude Code 需要至少一次 API 调用后才会写入用量数据。使用 Claude Code 发送一条消息后再试。
+`rate_limits` 仅在订阅用户的 API 响应后才出现。在任意一个会话里发一条消息触发 API 调用，数据会写入共享缓存，其他会话随后即可读到。
 
 ### 进度条不显示颜色
 
@@ -152,11 +150,11 @@ chmod +x ~/Developer/claude-statusline/statusline.py
 
 ## 📊 数据来源
 
-| 数据 | 来源文件 |
-|------|----------|
-| 5h/7d 用量 | `~/.claude/vscode-claude-status-cache.json` |
-| Context | Claude Code 运行时传入 |
-| 模型信息 | `~/.claude/settings.json` |
+| 数据 | 来源 | 作用域 |
+|------|------|--------|
+| Context | stdin `context_window` | 单会话 |
+| 5h/7d 用量 | stdin `rate_limits` + 共享缓存 | 账号级（多会话共享）|
+| 模型信息 | stdin `model` | 单会话 |
 
 ## 🤝 贡献
 
@@ -175,7 +173,6 @@ chmod +x ~/Developer/claude-statusline/statusline.py
 ## 🙏 致谢
 
 - [Claude Code](https://github.com/anthropics/claude-code) - Anthropic 官方 CLI
-- [Rich](https://github.com/Textualize/rich) - Python 终端美化库（TUI 模式使用）
 
 ## 📮 联系方式
 
